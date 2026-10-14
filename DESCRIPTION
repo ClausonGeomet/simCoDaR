@@ -1,0 +1,22 @@
+Package: simCoDaR
+Title: Simulation of Compositional Data and Ideal Mineral Assays
+Version: 0.1.0.9000
+Authors@R: person("Matt", "Clauson", email = "matthewclauson@outlook.com", role = c("aut", "cre"))
+Description: Simulates closed mineral compositions from hypothetical domain
+    targets and fits multivariate distributions to measured assay
+    subcompositions, including Dirichlet, logistic-normal, isometric log-ratio
+    Student-t and Gaussian mixture models. Provides reproducible synthetic
+    draws and held-out distributional diagnostics. Converts ideal fixed-formula
+    mineral mass fractions to theoretical elemental and oxide reporting
+    features with explicit units and mass-balance audits. Statistical assay
+    fits do not establish physical mineral calibration, instrument response,
+    spatial continuity or causal relationships.
+License: GPL-3
+Encoding: UTF-8
+Depends: R (>= 4.0.0)
+Imports: stats, withr
+Suggests: testthat (>= 3.0.0), knitr, rmarkdown,
+    ggplot2, ggdist, dplyr, tidyr, purrr, tibble
+VignetteBuilder: knitr
+Config/testthat/edition: 3
+NeedsCompilation: no

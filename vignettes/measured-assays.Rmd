@@ -1,0 +1,328 @@
+---
+title: "From measured assays to synthetic geometallurgical compositions"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{From measured assays to synthetic geometallurgical compositions}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 8, fig.height = 5)
+library(simCoDaR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(ggdist)
+```
+
+The fitted simulator learns a **joint distribution of selected assay
+logratios**, not just a set of independent proportions that sum to one.
+You can generate synthetic subcompositions to test how statistical methods
+respond to observed multivariate dependence. This is a statistical model
+of an assay dataset, not an inference of mineralogy, texture, recovery,
+spatial continuity, or deposit-scale physical calibration.
+
+If you need **known mineralogical truth and theoretical assay chemistry**,
+start instead with the [commodity scenario vignette](commodity-scenarios.html).
+That workflow begins with explicit, uncalibrated mineral mixtures.
+
+## Choose the simulation workflow
+
+| Starting information | Generate | What it does **not** establish |
+|:--|:--|:--|
+| Hypothetical mineral fractions and domain targets | Closed mineral compositions, then ideal element/oxide reporting | A fitted deposit model or measured XRD/XRF/ICP response |
+| Measured assays with compatible, nonoverlapping parts | New draws from a fitted joint compositional distribution | Mineral phase truth, original assay total or spatial continuity |
+
+These workflows are **not yet a joint calibrated mineralogy-to-assay model**.
+In particular, fitting oxide ratios cannot recover their contributing mineral
+phases: multiple mineral mixtures can produce similar bulk chemistry.
+
+## Select a common measurement basis
+
+The installed example comes from Zindorf, März and Schnetger (2020),
+[Site U1418, IODP Expedition 341](https://doi.org/10.2204/iodp.proc.341.206.2020).
+Major oxides are dry-sediment **wt%**; separate trace columns are **ppm** and depth
+is **m CCSF-A**. This sediment core illustrates statistical fitting, not an ore
+calibration population. The authors' data are CC BY 4.0; package code is GPL-3.
+The bundled CSV selects and renames workbook columns without changing numerical
+cells or blanks. It has 284 identified rows; the report says 285 analysed.
+The workbook checksum is historical, with no fresh cell-equivalence claim.
+
+```{r data}
+assays <- read.csv(system.file("extdata", "iodp_u1418_major_trace.csv",
+                             package = "simCoDaR", mustWork = TRUE),
+                   check.names = FALSE) %>% as_tibble()
+parts <- c("SiO2", "TiO2", "Al2O3", "Fe2O3", "MnO", "MgO", "CaO",
+           "Na2O", "K2O", "P2O5")
+assays %>% summarise(rows = n(), unique_samples = n_distinct(sample_id),
+                    reported_total_min = min(oxide_total_wt_pct),
+                    reported_total_max = max(oxide_total_wt_pct))
+```
+
+All ten selected oxides are positive. Reported totals range from 90.8 to 96.2
+wt%; we retain those amounts in the source table. Fitting closes only the selected
+parts: each is divided by their row sum. Outputs are fractions of that selected
+sum, not recovered dry-sediment wt%. No remainder or total-to-100 correction is
+created. Trace ppm, elemental equivalents and mineral volume percentages must
+not be mixed into this closure. Unit labels describe inputs and never convert
+them; the caller must establish nonoverlapping chemical species.
+
+## Freeze the holdout before fitting
+
+Choose a 71-row contiguous interval in depth order using a declared RNG and seed.
+All four families use its same 213-row complement in original row order.
+Depth influences the split only. No heldout observations choose parameters,
+mixture size, degrees of freedom or transformations.
+
+```{r split}
+scoped <- function(seed, code) withr::with_seed(seed, code,
+  .rng_kind = "Mersenne-Twister", .rng_normal_kind = "Inversion",
+  .rng_sample_kind = "Rejection")
+ordered <- order(assays$depth_m, seq_len(nrow(assays)))
+start <- scoped(20260924L, sample.int(214L, 1L))
+heldout_rows <- sort(ordered[seq.int(start, length.out = 71L)])
+training_rows <- setdiff(seq_len(nrow(assays)), heldout_rows)
+train <- assays[training_rows, ]
+heldout <- assays[heldout_rows, ]
+tibble(training_n = nrow(train), heldout_n = nrow(heldout), start = start,
+       depth_min = min(heldout$depth_m), depth_max = max(heldout$depth_m))
+models <- c("dirichlet", "logistic_normal", "ilr_student_t", "ilr_mixture")
+```
+
+With this RNG, start is 108 and the interval is 298.470–539.290 m CCSF-A.
+The historical exact primary interval and RNG environment are unavailable;
+this is a new reproduction of the recovered recipe. Nearby core rows are
+correlated, so heldout performance is a depth sensitivity check rather than
+independent geological external validation.
+
+## Fit once, then draw
+
+Dirichlet uses positive-alpha maximum likelihood. It is a restricted baseline:
+distinct-part population covariance is always negative. Logistic normal fits
+full covariance in nine orthonormal logratio (ILR) dimensions. Student t fits
+location and full **scale** at predeclared df5; its covariance is 5/3 times scale.
+The mixture fits full component covariance with multiple starts, choosing k2 or
+k3 by **training BIC**. Statistical components do not identify geological facies.
+Inspect convergence, failed candidates and regularization before interpreting a fit.
+
+```{r fit}
+fits <- set_names(models) %>% map(function(model) {
+  scoped(20260924L, fit_assay_simulator(train, parts, model,
+    seed = 20260924L, student_df = 5, mixture_components = 2:3,
+    unit_label = "wt%", measurement_basis = "oxide_mass"))
+})
+# Public fit objects expose parameters and diagnostics; no private helpers.
+pattern <- fits$ilr_mixture$groups[[1]]$patterns[[1]]
+tibble(k = as.integer(names(pattern$model$bic)),
+       training_BIC = as.numeric(pattern$model$bic))
+pattern$model$selected_components
+pattern$model$diagnostics
+synthetic <- scoped(123L, simulate_assays(fits$ilr_student_t, n = 71, seed = 123L))
+synthetic %>% summarise(across(all_of(parts), mean))
+attr(synthetic, "diagnostics")
+```
+
+### Inspect generated proportions
+
+```{r generated-proportions}
+# The generated rows sum to one across the selected oxide parts.
+stopifnot(max(abs(rowSums(synthetic[parts]) - 1)) < 1e-10)
+
+# A single synthetic draw has a descriptive, not guaranteed, correlation.
+round(cor(synthetic[c("Fe2O3", "MgO")]), 3)
+```
+
+Multiplying a simulated value by 100 yields **percent of the selected
+ten-oxide sum**, not the corresponding whole-rock oxide wt%. Recovering
+absolute wt% would require an explicitly fitted or specified total model,
+which this API does not provide. Neither closure nor a favourable
+correlation from one draw proves the model reproduces real geology.
+
+`fit_assay_simulator()` returns a serializable `geo_assay_simulator` list with
+part order, fitted basis, parameters, aggregate counts, controls, assumptions and
+RNG/version metadata. It omits training rows/IDs/totals; parameters and necessary
+group labels can still disclose information. `simulate_assays()` returns a data
+frame of closed fractions with assumptions and diagnostics attributes. Sparse
+supports and nonconvergence fail explicitly, without resampling raw rows.
+Zeros are refused by default. Only metadata-established structural absence may
+be declared; censoring, rounding and missing values need a separate model.
+Grouped/structural fitting is available, but the first public validator supports
+only positive, ungrouped full support. No total or total–composition model is fitted.
+
+## Compare heldout distributions
+
+The laptop tutorial uses four primary fits and **four 71-row draws per model**.
+It does not rerun the complete five-split study. All log scores use the same fitted
+ordered Helmert ILR Lebesgue measure. For Dirichlet the coordinate-simplex density
+is converted by subtracting log J, where log J = −log(D)/2 − sum(log x).
+Comparing unadjusted simplex and ILR densities would give misleading scores.
+Higher mean log score is better; lower energy, covariance error and logratio
+quantile discrepancy are better, but these assess different aspects.
+
+```{r diagnose}
+evaluations <- imap(fits, function(fit, model) {
+  m <- match(model, models)
+  base_seed <- 20261014L + 100L * m
+  scoped(base_seed, validate_assay_simulator(fit, heldout, reference = train,
+    n_draws = 71L, replicates = 4L, seed = base_seed))
+})
+score_table <- imap_dfr(evaluations, function(x, model) {
+  tibble(model = model, mean_ILR_log_score = x$score_summary$mean_log_score,
+         draw_failures = nrow(x$failures))
+})
+score_table %>% arrange(desc(mean_ILR_log_score))
+metrics <- imap_dfr(evaluations, function(x, model) {
+  as_tibble(x$mc_summary) %>% mutate(model = model, .before = 1)
+})
+metrics %>% filter(metric %in% c("ilr_energy", "ilr_covariance_relative_error",
+                                "mean_absolute_logratio_quantile_error"), statistic == "generated")
+```
+
+Energy is the ILR V-statistic including diagonal zero distances. Covariance error
+is relative Frobenius error using sample covariance. Pairwise logratio quantiles
+use probabilities .05, .25, .5, .75, .95 (type7). Tail diagnostics use strict
+heldout thresholds and, when reference is supplied, training closed-part .01/.99
+bounds; the latter count **cells**, not rows. The output retains pointwise scores,
+long replicate metrics, generated/discrepancy MC summaries, failure messages and
+metadata, rather than input or generated assay tables.
+
+MCSE is sample SD divided by sqrt(successful repetitions): conditional draw
+noise given this fit and heldout set. Four repetitions provide a rough tutorial
+estimate, not field uncertainty, parameter uncertainty or a confidence interval.
+Check success/failure counts; incomplete summaries must not be treated as complete.
+The validator never fits or tunes a model and does not certify scientific validity.
+
+## See learned dependence and marginals
+
+Use one fresh 71-row draw per model for display. All panels show **closed selected
+oxide percent**, not original wt%. Identical axes allow comparisons with the
+heldout relationships. A draw is illustrative; the replicate diagnostics above
+are better for quantifying stochastic differences.
+
+```{r plot-data}
+close_percent <- function(x) {
+  x %>% select(all_of(parts)) %>%
+    mutate(total = rowSums(pick(all_of(parts)))) %>%
+    mutate(across(all_of(parts), ~ 100 * .x / total)) %>% select(-total)
+}
+observed <- close_percent(heldout) %>% mutate(distribution = "Heldout")
+draws <- imap_dfr(fits, function(fit, model) {
+  scoped(20262014L + match(model, models),
+    simulate_assays(fit, 71L, seed = 20262014L + match(model, models))) %>%
+    as_tibble() %>% mutate(across(all_of(parts), ~ 100 * .x), distribution = model)
+})
+plot_data <- bind_rows(observed, draws) %>%
+  mutate(distribution = factor(distribution, levels = c("Heldout", models)))
+relationship <- ggplot(plot_data, aes(Fe2O3, MgO)) +
+  geom_point(alpha = .65, size = 1.4, colour = "#25666d") +
+  facet_wrap(~ distribution, ncol = 3) + theme_minimal(base_size = 11) +
+  labs(title = "Fe2O3–MgO dependence in the selected oxide subcomposition",
+       subtitle = "71 untouched heldout rows; one illustrative draw per fitted family",
+       x = "Closed Fe2O3 (% of ten-oxide sum)",
+       y = "Closed MgO (% of ten-oxide sum)")
+relationship
+```
+
+```{r rainclouds, fig.height=6}
+marginals <- plot_data %>% select(distribution, Fe2O3, MgO) %>%
+  pivot_longer(-distribution, names_to = "oxide", values_to = "closed_percent")
+raincloud <- ggplot(marginals, aes(distribution, closed_percent, fill = distribution)) +
+  ggdist::stat_halfeye(adjust = .7, width = .6, justification = -.18,
+                       point_interval = NULL, .width = 0, alpha = .7) +
+  geom_point(position = position_jitter(width = .09, height = 0, seed = 20261014L),
+             size = .9, alpha = .4) +
+  facet_wrap(~ oxide, scales = "free_y", ncol = 1) +
+  scale_fill_manual(values = c("#444444", "#a96b39", "#26858c", "#7676a9", "#719340")) +
+  theme_minimal(base_size = 11) + theme(legend.position = "none") +
+  labs(title = "Marginals: heldout assays and fitted draws",
+       subtitle = "Half densities and exact-valued points; categorical jitter only",
+       x = NULL, y = "Closed selected oxide (%)")
+raincloud
+```
+
+Half densities are smoothed distributions, not uncertainty bands; widths are
+normalized within panels and do not represent counts. Separate marginal panels
+cannot establish joint dependence. Dirichlet's distinct-proportion covariance
+is −alpha_a alpha_b / [alpha_0²(alpha_0+1)]; positive finite-draw correlation can
+occur by chance even though its population restriction cannot match the positive
+heldout Fe2O3–MgO relationship.
+
+To save standalone figures after running these chunks, choose a writable output
+folder. PNG and SVG use the same ggplot objects; R's SVG device avoids an extra
+export dependency:
+
+```{r export, eval=FALSE}
+figure_dir <- tempfile("assay-figures-")
+dir.create(figure_dir)
+ggplot2::ggsave(file.path(figure_dir, "relationship.png"), relationship,
+               width = 10, height = 6, dpi = 160, bg = "white")
+ggplot2::ggsave(file.path(figure_dir, "marginals.png"), raincloud,
+               width = 10, height = 7, dpi = 160, bg = "white")
+ggplot2::ggsave(file.path(figure_dir, "relationship.svg"), relationship,
+               width = 10, height = 6, device = grDevices::svg, bg = "white")
+ggplot2::ggsave(file.path(figure_dir, "marginals.svg"), raincloud,
+               width = 10, height = 7, device = grDevices::svg, bg = "white")
+```
+
+## Using the generated data responsibly
+
+This workflow is useful for checking statistical algorithms under a
+measured, fitted dependence structure. It is **not** a source of independent
+geological samples: the generated data inherit the selected dataset,
+measurement basis, modelling assumptions and any sampling biases.
+
+For method benchmarks, preserve a separate evaluation sample and keep model
+selection, transformations and tuning inside training data. The held-out
+scores here describe predictive fit to one sediment core, not the accuracy
+of mineral proportions or a causal effect.
+
+If your objective is **element-to-mineral conversion**, use the known
+mineral-truth simulation from the commodity vignette as a separate test
+fixture. Do not treat the ten fitted oxide parts as minerals or pass them
+to `minerals_to_assay()`. Connecting observed mineral abundances with
+measured assays requires paired data, compatible mass/volume bases and an
+explicit measurement/chemistry model.
+
+## Full companion and recorded reproduction
+
+The installed companion freezes all five manifests/configuration before fitting,
+then runs 20 fits and 400 small draw tables sequentially. It also reports training
+BIC, pointwise scores, candidate/failure diagnostics and paired descriptive
+400-bootstrap primary score differences. Running it is optional and separate
+from this tutorial:
+
+```{r companion, eval=FALSE}
+script <- system.file("examples", "iodp-empirical.R", package = "simCoDaR",
+                      mustWork = TRUE)
+out <- tempfile("iodp-five-splits-")
+system2(file.path(R.home("bin"), "Rscript"), c(shQuote(script), shQuote(out), "full"))
+# Use "freeze" to write manifests only, or "smoke" for one normal fit and tiny draws.
+```
+
+The recorded new reproduction used 20 draws per model/split. Student t had highest
+log score and Dirichlet lowest on all five splits. Primary mean ILR log scores
+were 7.352454, 16.055868, 17.381956 and 16.556801 in the model order above.
+Primary energy (mean ± conditional MCSE) was Dirichlet 0.138366 ± 0.003432,
+normal 0.012168 ± 0.000658, Student 0.011937 ± 0.001036 and mixture
+0.011680 ± 0.001015. The historical primary normal-better-energy claim was not
+reproduced; normal energy was lower than Student on the four additional folds.
+Differences in split/RNG and convergence methods preclude exact historical
+numerical recovery. These ranks are observed results, never code acceptance
+criteria. The paired iid bootstrap is descriptive because it ignores depth dependence.
+
+Primary heldout closed Fe2O3–MgO correlation was 0.808654. Mean generated
+correlations were −0.061960, 0.879018, 0.874369 and 0.871385. All mixtures
+selected k2 on training BIC; recorded fits/draws had no failures or inverse floors.
+Inspect actual diagnostics in every new use; this is not a universal guarantee.
+Additional heldout depth ranges are 1.434–214.346, 216.368–414.250,
+421.390–667.370 and 673.610–972.210 m; their training sets overlap.
+
+For attribution, extraction details and checksums, read installed
+`extdata/IODP-LICENSE-PROVENANCE.md`. The separate installed
+`extdata/SOURCE-CATALOGUE.md` describes six small mineral/assay reference sources,
+units, rights and QA limitations. None is fitted here or establishes physical
+mineral calibration. [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+requires attribution and a modification notice; no endorsement is implied.

@@ -1,0 +1,8 @@
+export(new_assay_scenario)
+export(simulate_assay_scenario)
+export(mineral_assay_library)
+export(minerals_to_assay)
+export(simulate_mineral_assay_scenario)
+export(fit_assay_simulator)
+export(simulate_assays)
+export(validate_assay_simulator)

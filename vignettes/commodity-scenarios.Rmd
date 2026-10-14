@@ -1,0 +1,406 @@
+---
+title: "From hypothetical commodity mixtures to ideal assays"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{From hypothetical commodity mixtures to ideal assays}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup}
+library(simCoDaR)
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 7,
+                      fig.height = 6, dpi = 120)
+```
+
+## Which simCoDaR workflow is this?
+
+| Workflow | Starting point | Output |
+|:--|:--|:--|
+| **This vignette: hypothetical mineralogy** | User-defined mineral targets, domain weights and spread | Known mineral fractions and ideal theoretical chemistry |
+| [Measured-assay vignette](measured-assays.html) | Observed compatible assay parts | New compositional draws from an empirically fitted statistical distribution |
+
+The two workflows answer different questions. **Neither automatically
+calibrates a deposit**, and an assay-only statistical fit does not identify
+the individual minerals that produced the chemistry.
+
+## 1. Start with a mineral mass mixture
+
+This vignette follows mineral targets through synthetic mineralogy to theoretical
+chemistry for iron ore, gold, nickel and manganese. These are new hypothetical
+illustrations, using the same public API as the package's two-domain example;
+they do not reproduce unavailable historical examples. All target values,
+probabilities and spreads are author choices, without deposit calibration.
+
+A **domain** is a label for a mixture distribution. Its target mineral proportions
+are distinct from the ideal chemical endmembers represented by the mineral
+library. Closed mineral fractions sum to one. Multiplying by 100 gives phase
+mass percentages. Atom-count stoichiometry then gives bulk elemental wt% and
+oxide equivalents; multiplying element wt% by 10,000 gives ppm by mass.
+
+The wrapper calls its reporting tables `observed`: XRD-style phase mass%,
+XRF-style oxide wt% and ICP-style element ppm. They have no diffraction
+intensities, instrument response or added measurement noise. Truth/reporting
+separation is organizational, and both remain available.
+
+## 2. Inspect the ideal formulas
+
+```{r library}
+lib <- mineral_assay_library()
+selected <- c("Hematite", "Magnetite", "Goethite", "Quartz", "NativeGold",
+              "Pyrite", "Bunsenite", "Lizardite", "Pyrolusite", "Manganite",
+              "Rhodochrosite")
+formula_table <- tibble::tibble(
+  mineral = selected,
+  formula_label = purrr::map_chr(lib[selected], function(z) z$formula),
+  atoms = purrr::map_chr(lib[selected], function(z)
+    paste(names(z$atoms), z$atoms, sep = "=", collapse = ", ")))
+knitr::kable(formula_table, row.names = FALSE)
+```
+
+Formula strings are labels; explicit positive atom counts control calculation.
+Formula mass is the sum of atom counts times the package atomic weights. An
+individual element's mass fraction is its atom mass contribution divided by
+that formula mass. Fe2/Fe3 and Mn2/Mn3/Mn4 encode valences. A compatible supplied
+library needs named formula/atoms entries, supported elements and compatible
+oxygen/volatile stoichiometry (or supported oxygen-free native/sulfide formulas).
+These examples use only the built-in library. Its source attribution and fixed
+constants are recorded in the package's `inst/PROVENANCE.md` and source; these
+are sufficient assumptions for the hypothetical arithmetic used here.
+
+## 3. Choose four two-domain targets
+
+```{r targets}
+targets <- list(
+  iron = rbind(
+    rich = c(Hematite = .55, Magnetite = .20, Goethite = .15, Quartz = .10),
+    gangue = c(Hematite = .10, Magnetite = .05, Goethite = .05, Quartz = .80)),
+  gold = rbind(
+    rich = c(NativeGold = 5e-6, Pyrite = .08, Quartz = 1 - .08 - 5e-6),
+    gangue = c(NativeGold = .5e-6, Pyrite = .02, Quartz = 1 - .02 - .5e-6)),
+  nickel = rbind(
+    rich = c(Bunsenite = .02, Lizardite = .58, Quartz = .40),
+    gangue = c(Bunsenite = .002, Lizardite = .398, Quartz = .60)),
+  manganese = rbind(
+    rich = c(Pyrolusite = .45, Manganite = .15, Rhodochrosite = .10, Quartz = .30),
+    gangue = c(Pyrolusite = .08, Manganite = .04, Rhodochrosite = .03, Quartz = .85)))
+weights <- c(rich = .4, gangue = .6)
+spread <- c(rich = .25, gangue = .15)
+seeds <- c(iron = 42, gold = 43, nickel = 44, manganese = 45)
+stopifnot(all(vapply(targets, function(t) max(abs(rowSums(t) - 1)) <= 1e-10,
+                     logical(1))))
+for (commodity in names(targets)) {
+  cat("\n", commodity, "target fractions\n")
+  print(targets[[commodity]], digits = 7)
+}
+```
+
+The constructor normalizes each target row. Normalized targets are geometric
+centers in isometric log-ratio (ILR) coordinates for the untruncated generator,
+not guaranteed arithmetic sample means. Weights give independent domain-label
+probabilities, so 200 samples need not contain exactly 80 rich samples.
+`logratio_sd` is an isotropic normal standard deviation in orthonormal ILR
+coordinates on each domain's positive support, rather than percentage error bars.
+
+## 4. Draw mineralogy, convert it, then use the wrapper
+
+```{r direct}
+iron_spec <- new_assay_scenario(targets$iron, weights = weights,
+                                 logratio_sd = spread)
+draw <- simulate_assay_scenario(iron_spec, n = 200, seed = seeds[["iron"]])
+assay <- minerals_to_assay(draw$composition, basis = "fraction")
+assay_percent <- minerals_to_assay(100 * draw$composition, basis = "percent")
+stopifnot(max(abs(as.matrix(assay$elements - assay_percent$elements))) <= 1e-6,
+          max(abs(as.matrix(assay$element_ppm - assay_percent$element_ppm))) <= .01,
+          max(abs(as.matrix(assay$oxides_reported -
+                            assay_percent$oxides_reported))) <= 1e-6)
+head(tibble::tibble(sample_id = draw$sample_id, domain = draw$facies,
+                Hematite_mass_percent = 100 * draw$composition$Hematite,
+                Fe_ppm = assay$element_ppm$Fe), 4)
+```
+
+Conversion requires inputs already closed to the declared basis. It does not
+silently renormalize rows. The default `closure_tolerance = 1e-6` is in input
+basis units: fraction units for `fraction`, mass-percent units for `percent`.
+Bulk elements include oxygen and all represented elements; a selected metal
+subset should not be closed separately. Oxide wt% is neither metal wt% nor ppm.
+
+```{r wrapper}
+iron <- simulate_mineral_assay_scenario(iron_spec, n = 200, seed = seeds[["iron"]])
+stopifnot(identical(draw$sample_id, iron$sample_id),
+          identical(draw$facies, iron$domains$domain),
+          identical(draw$composition, iron$truth$mineral_fraction),
+          identical(assay, iron$truth$assay))
+names(iron$observed)
+names(iron$truth)
+iron$metadata[c("units", "calibrated", "measurement_model",
+                "truth_equals_ideal_reporting")]
+scenarios <- purrr::map(targets, new_assay_scenario, weights = weights,
+                         logratio_sd = spread)
+results <- c(list(iron = iron), purrr::map2(scenarios[-1], seeds[-1],
+  function(scenario, seed) simulate_mineral_assay_scenario(scenario, n = 200, seed = seed)))
+```
+
+`sample_id` keys the domain table and rows in all mineral/chemistry tables.
+`truth$mineral_fraction` retains fractions, while `truth$assay` includes physical
+components, water/volatiles, unreported elements and mass-balance audits.
+
+## 5. Control spread, bounds and absence
+
+Zero spread returns each sampled domain's normalized target. Compare it with the
+positive-spread iron draw; finite sample variability is descriptive.
+
+```{r controls}
+fixed_spec <- new_assay_scenario(targets$iron, weights = weights, logratio_sd = 0)
+fixed <- simulate_assay_scenario(fixed_spec, n = 200, seed = 42)
+stopifnot(max(abs(as.matrix(fixed$composition) -
+                  targets$iron[fixed$facies, , drop = FALSE])) <= 1e-10)
+spread_data <- tibble::tibble(
+  sample_id = draw$sample_id,
+  domain = factor(draw$facies, levels = c("rich", "gangue")),
+  fixed_Hematite_mass_percent = 100 * fixed$composition$Hematite,
+  varied_Hematite_mass_percent = 100 * draw$composition$Hematite)
+spread_comparison <- dplyr::summarise(dplyr::group_by(spread_data, domain),
+  dplyr::across(dplyr::ends_with("mass_percent"), sd, .names = "{.col}_SD"),
+  .groups = "drop")
+knitr::kable(spread_comparison, digits = 4, row.names = FALSE)
+bounded_spec <- new_assay_scenario(targets$iron, weights = weights,
+  logratio_sd = spread, composition_bounds = list(Hematite = c(.05, .90)))
+bounded <- simulate_assay_scenario(bounded_spec, n = 200, seed = 42,
+                                    max_draw_attempts = 1000)
+range(bounded$composition$Hematite)
+bounded$assumptions$composition_rejection_rate
+```
+
+Bounds use fraction units and reject candidates, changing the accepted
+distribution. The rejection rate is rejected candidates divided by attempted
+candidates. Exhaustion of the finite per-domain rejection-round budget stops
+instead of relaxing bounds. No monotonic finite-sample SD claim is needed.
+
+Structural absence requires a zero target and the part name in
+`structural_parts`; it remains zero only in domains where its target is zero.
+This differs from censored trace values or detection limits. Both gold targets
+here are strictly positive, with no structural zeros or censoring.
+
+## 6. Read commodity-specific chemistry
+
+Gold's NativeGold fraction `5e-6` equals **0.0005 mineral mass%** and **5 Au ppm**;
+`0.5e-6` equals **0.00005 mass%** and **0.5 Au ppm**. These are target values,
+not promised sampled arithmetic means. Gold is supplied explicitly, not inferred
+from Pyrite. Au has no reported oxide: `element_ppm$Au` holds ppm and
+`unreported_elements$Au` holds elemental wt%. Pyrite remains nonoxide physical
+mineral mass, while its Fe receives a reported oxide equivalent.
+
+Bunsenite is the library's ideal NiO (`Ni=1,O=1`). Lizardite has Mg, Si, O and H,
+and contains no Ni in this library. Thus this example is an ideal NiO-bearing
+mixture, not a calibrated laterite or nickel-bearing serpentine model. Using the
+package constants, Ni's fraction in NiO is
+`58.6934 / (58.6934 + 15.999) = 0.7858015`: 2 mineral mass% gives about
+1.571603 Ni wt%, or 15716.03 Ni ppm. NiO reported wt% equals Bunsenite mass%
+here; Ni elemental wt% differs. No nickel sulfide or solid-solution model is implied.
+
+Pyrolusite, Manganite and Rhodochrosite have Mn mass fractions approximately
+0.6319363, 0.6246932 and 0.4779463. Encoded valences yield separate MnO2, Mn2O3
+and MnO columns. Their sum must not be relabelled as MnO or elemental Mn.
+H2O and CO2 equivalents are bookkeeping, not measured loss on ignition.
+
+```{r target-chemistry}
+target_assays <- purrr::map(targets, minerals_to_assay)
+knitr::kable(data.frame(
+  domain = rownames(targets$gold),
+  NativeGold_mass_percent = format(100 * targets$gold[, "NativeGold"], scientific = TRUE),
+  Au_ppm = target_assays$gold$element_ppm$Au,
+  Au_unreported_wt_percent = format(target_assays$gold$unreported_elements$Au,
+                                   scientific = TRUE)), row.names = FALSE)
+stopifnot(max(abs(target_assays$gold$element_ppm$Au - c(5, .5))) <= .01,
+          abs(target_assays$nickel$element_ppm$Ni[1] - 15716.03) <= .01,
+          max(abs(target_assays$nickel$oxides_reported$NiO -
+                    100 * targets$nickel[, "Bunsenite"])) <= 1e-6)
+knitr::kable(target_assays$manganese$oxides_reported[c("MnO2", "Mn2O3", "MnO")],
+             digits = 4, caption = "Manganese target oxide equivalents (wt%).")
+```
+
+Summaries below are arithmetic sample means and SDs, distinct from target centers.
+Each table retains its own mineral, element and oxide units; trace gold is
+formatted scientifically so rounding does not hide it.
+
+```{r summaries, results='asis'}
+primary_mineral <- c(iron = "Hematite", gold = "NativeGold", nickel = "Bunsenite",
+                     manganese = "Pyrolusite")
+primary_element <- c(iron = "Fe", gold = "Au", nickel = "Ni", manganese = "Mn")
+oxide_fields <- list(iron = c("FeO", "Fe2O3"), gold = c("FeO", "SiO2"),
+                     nickel = c("NiO", "MgO"), manganese = c("MnO2", "Mn2O3"))
+for (commodity in names(results)) {
+  x <- results[[commodity]]
+  values <- tibble::tibble(sample_id = x$sample_id,
+    domain = factor(x$domains$domain, levels = c("rich", "gangue")),
+    mineral = x$observed$xrd_phase_percent[[primary_mineral[[commodity]]]],
+    element = x$observed$icp_element_ppm[[primary_element[[commodity]]]])
+  values <- dplyr::bind_cols(values,
+    tibble::as_tibble(x$observed$xrf_oxide_wt_percent[oxide_fields[[commodity]]]))
+  tab <- dplyr::summarise(dplyr::group_by(values, domain),
+    n = dplyr::n(), mineral_mean = mean(mineral),
+    element_mean = mean(element), element_SD = sd(element),
+    dplyr::across(dplyr::all_of(oxide_fields[[commodity]]), mean), .groups = "drop")
+  names(tab)[3:5] <- c(paste0(primary_mineral[[commodity]], "_mean_mass_percent"),
+                       paste0(primary_element[[commodity]], "_mean_ppm"),
+                       paste0(primary_element[[commodity]], "_SD_ppm"))
+  names(tab)[-(1:5)] <- paste0(oxide_fields[[commodity]], "_mean_wt_percent")
+  if (commodity == "gold") tab$NativeGold_mean_mass_percent <-
+    format(tab$NativeGold_mean_mass_percent, scientific = TRUE, digits = 4)
+  cat("\n\n", knitr::kable(tab, format = "html", digits = 3, row.names = FALSE,
+    col.names = c("Domain", "n", paste(primary_mineral[[commodity]], "mass%"),
+                  paste(primary_element[[commodity]], "ppm"),
+                  paste(primary_element[[commodity]], "SD (ppm)"),
+                  paste(oxide_fields[[commodity]], "wt%")),
+    caption = paste(commodity, "sample means and elemental SD")), "\n\n", sep = "")
+}
+```
+
+```{r domain-plots, fig.cap='Synthetic marginal elemental densities and individual samples, 200 per commodity. Each panel retains its own ppm scale; jitter changes category position only.'}
+plot_data <- dplyr::bind_rows(purrr::imap(results, function(x, commodity_name) {
+  tibble::tibble(sample_id = x$sample_id, commodity = commodity_name,
+    domain = factor(x$domains$domain, levels = c("rich", "gangue")),
+    ppm = x$observed$icp_element_ppm[[primary_element[[commodity_name]]]])
+}))
+plot_data <- tidyr::pivot_longer(plot_data, ppm, names_to = "unit", values_to = "value")
+plot_data$commodity <- factor(plot_data$commodity, levels = names(results),
+  labels = c("Iron / Fe (ppm by mass)", "Gold / Au (ppm by mass)",
+             "Nickel / Ni (ppm by mass)", "Manganese / Mn (ppm by mass)"))
+colors <- c(rich = "#007C91", gangue = "#C75B2A")
+raincloud <- ggplot2::ggplot(plot_data,
+  ggplot2::aes(x = domain, y = value, fill = domain)) +
+  ggdist::stat_halfeye(orientation = "vertical", side = "right",
+    normalize = "panels",
+    subscale = function(z) ggdist::subscale_thickness(sqrt(z)),
+    show_slab = TRUE, show_interval = FALSE,
+    show_point = FALSE, trim = TRUE, scale = .5, justification = 0,
+    position = ggplot2::position_nudge(x = .12), alpha = .65, slab_colour = NA) +
+  ggplot2::geom_point(ggplot2::aes(color = domain), size = .7, alpha = .55,
+    position = ggplot2::position_jitter(width = .06, height = 0, seed = 20261014),
+    show.legend = FALSE) +
+  ggplot2::facet_wrap(~ commodity, ncol = 2, scales = "free_y") +
+  ggplot2::scale_fill_manual(values = colors, name = "Domain") +
+  ggplot2::scale_color_manual(values = colors, guide = "none") +
+  ggplot2::scale_x_discrete(expand = ggplot2::expansion(add = c(.3, .7))) +
+  ggplot2::labs(x = "Hypothetical domain", y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(legend.position = "top", strip.text = ggplot2::element_text(face = "bold"),
+    panel.grid.major.x = ggplot2::element_blank(), panel.grid.minor = ggplot2::element_blank())
+withr::with_preserve_seed(print(raincloud))
+```
+
+Half-clouds show smoothed marginal distributions of synthetic samples within each
+domain. Density thickness uses a square-root display scale, normalized within
+each panel, to keep broad rich-domain Au and Ni clouds visible alongside narrower
+gangue clouds. Thickness is not a domain count or an uncertainty interval. Points retain exact ppm values; jitter seed 20261014 moves
+only their categorical positions. Separate vertical scales keep trace Au readable.
+These marginal distributions do not display pairwise correlations or prove causality.
+
+Deterministic conversion gives straight-line mineral-to-element relationships
+when an element has one host (Au in NativeGold, Ni in Bunsenite here). Fe and Mn
+have multiple hosts in these mixtures. Closure and domain mixing also shape
+correlations; these associations have no causal interpretation.
+
+## 7. Audit mass and iron reporting
+
+Default iron reporting keeps FeO and Fe2O3 separate. On the same fractions,
+`total_Fe2O3` replaces them with `Fe2O3_total`; FeO is omitted. Magnetite's Fe(II)
+contribution makes the added oxygen equivalent visible, while elemental and
+physical mass stay unchanged.
+
+```{r iron-reporting}
+total_iron <- minerals_to_assay(draw$composition, iron_reporting = "total_Fe2O3")
+stopifnot("Fe2O3_total" %in% names(total_iron$oxides_reported),
+          !"FeO" %in% names(total_iron$oxides_reported),
+          identical(assay$elements, total_iron$elements),
+          identical(assay$oxides_physical, total_iron$oxides_physical))
+audit_fields <- c("mineral_mass_wt_pct", "element_mass_wt_pct",
+                  "physical_components_wt_pct", "reported_components_wt_pct",
+                  "reporting_oxygen_gain_wt_pct")
+knitr::kable(rbind(
+  separate = assay$mass_balance[1, audit_fields],
+  total_Fe2O3 = total_iron$mass_balance[1, audit_fields]), digits = 4,
+  caption = "Same first iron sample: mass-balance fields in wt%.")
+```
+
+Physical components include oxide-compatible physical oxides, H2O and CO2
+equivalents, and nonoxide mineral mass. Reported components use cation oxide
+equivalents, water, CO2 and unreported elements. Oxygen gain is the reported
+component total minus 100 wt%, not measurement error. Reported oxides are never
+renormalized; neither they nor their sum alone need equal 100. Do not close
+oxide wt% and elemental ppm together.
+
+```{r invariants}
+audit_errors <- dplyr::bind_rows(purrr::imap(results, function(x, commodity) {
+  a <- x$truth$assay
+  fraction_error <- max(abs(rowSums(x$truth$mineral_fraction) - 1))
+  percent_error <- max(abs(rowSums(x$observed$xrd_phase_percent) - 100))
+  element_error <- max(abs(a$mass_balance$element_mass_wt_pct -
+                            a$mass_balance$mineral_mass_wt_pct))
+  physical_error <- max(abs(a$mass_balance$physical_components_wt_pct -
+                             a$mass_balance$mineral_mass_wt_pct))
+  ppm_error <- max(abs(as.matrix(a$element_ppm - 10000 * a$elements)))
+  tables <- c(x$observed, list(x$truth$mineral_fraction),
+              a[vapply(a, is.data.frame, logical(1))])
+  stopifnot(identical(x$sample_id, x$domains$sample_id),
+            all(vapply(tables, function(t) identical(rownames(t), x$sample_id), logical(1))),
+            fraction_error <= 1e-10, percent_error <= 1e-8,
+            element_error <= 1e-6, physical_error <= 1e-6, ppm_error <= .01,
+            identical(x$observed$xrd_phase_percent, 100 * x$truth$mineral_fraction),
+            identical(x$observed$xrf_oxide_wt_percent, a$oxides_reported),
+            identical(x$observed$icp_element_ppm, a$element_ppm))
+  tibble::tibble(commodity = commodity, fraction_closure_error = fraction_error,
+             phase_percent_closure_error = percent_error,
+             element_mass_error_wt_percent = element_error,
+             physical_mass_error_wt_percent = physical_error,
+             ppm_factor_error = ppm_error)
+}))
+audit_display <- dplyr::mutate(audit_errors,
+  dplyr::across(-commodity, function(z) format(z, scientific = TRUE, digits = 3)))
+knitr::kable(audit_display, row.names = FALSE)
+```
+
+These are arithmetic invariants, not calibration evidence. Element and physical
+mass audits use 1e-6 wt%; fraction closure uses 1e-10. The displayed ppm factor
+check allows 0.01 ppm. No random sample mean is asserted equal to its target.
+
+## 8. Reproduce within stated limits
+
+An explicit seed restores caller RNG state on success or error, including when
+initially absent; `seed = NULL` consumes the caller's stream. RNG kind is unchanged
+and recorded. Matching inputs, R/package versions and RNG kind supports
+reproduction; cross-version bitwise identity is not promised.
+
+```{r versions}
+list(R = R.version.string, simCoDaR = as.character(packageVersion("simCoDaR")),
+     knitr = as.character(packageVersion("knitr")),
+     rmarkdown = as.character(packageVersion("rmarkdown")),
+     RNGkind = RNGkind(), seeds = seeds, recorded_RNGkind = iron$metadata$RNGkind,
+     rng_policy = iron$metadata$rng_policy)
+```
+
+Samples are independent conditional on domains, with user-selected uncalibrated
+centers/spreads and fixed formulas. There is no measurement uncertainty, censoring,
+spatial dependence, recovery or process prediction, or fitted solid solution.
+Mineral proportions and ideal chemical reporting are the full scope of this
+teaching exercise. This development API may change.
+
+## 9. Moving from assumed domains to empirical distributions
+
+The example above **chooses** domain centres and ILR spread. If you have
+measured, compositionally compatible assay columns instead, the separate
+[measured-assays vignette](measured-assays.html) demonstrates
+`fit_assay_simulator()`, `simulate_assays()` and
+`validate_assay_simulator()`. It compares Dirichlet, full-covariance
+logistic-normal, fixed-df ILR Student-t and ILR Gaussian-mixture models.
+
+Do not mix their outputs: empirical assay simulations close **selected
+assay parts**, whereas this vignette closes **mineral mass fractions**
+and applies ideal stoichiometry. There is no implemented bridge that
+infers mineral mixtures from an empirical oxide distribution or
+simulates XRD/XRF/ICP instrument measurement uncertainty.
+
+Use paired mineralogy and assay observations, compatible reporting bases,
+independently assessed mineral chemistry and a separate validation design
+before describing any extension as physically calibrated.
